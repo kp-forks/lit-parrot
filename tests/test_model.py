@@ -2,12 +2,9 @@
 
 from copy import deepcopy
 from functools import partial
-from pathlib import Path
-from urllib.request import urlretrieve
 
 import pytest
 import torch
-from conftest import RunIf
 from lightning import Fabric
 from lightning.fabric.utilities.imports import _IS_WINDOWS
 from lightning.fabric.utilities.init import _materialize_meta_tensors
@@ -37,6 +34,7 @@ from litgpt.scripts.convert_hf_checkpoint import (
     copy_weights_hf_llama,
     copy_weights_phi,
 )
+from tests.conftest import RunIf
 
 
 @torch.inference_mode()
@@ -86,6 +84,7 @@ def test_against_gpt_neox_model(rotary_pct, batch_size, n_embd, parallel_residua
         rotary_pct=ours_config.rotary_percentage,
         vocab_size=ours_config.padded_vocab_size,
         use_parallel_residual=ours_config.parallel_residual,
+        attn_implementation="eager",
     )
 
     state_dict = {}
@@ -206,7 +205,13 @@ def test_against_original_open_llama_3b(device, dtype):
 @torch.inference_mode()
 @pytest.mark.parametrize(
     "ours_kwargs",
-    [{"name": "Llama-2-7b-hf"}, {"name": "CodeLlama-7b-hf"}, {"name": "Llama-2-70b-chat-hf", "n_query_groups": 1}],
+    [
+        {"name": "Llama-2-7b-hf"},
+        {"name": "CodeLlama-7b-hf"},
+        {"name": "Llama-2-70b-chat-hf", "n_query_groups": 1},
+        {"name": "Llama-3-8B"},
+        {"name": "Llama-3-8B-Instruct"},
+    ],
 )
 @pytest.mark.parametrize(
     ("device", "dtype"),
@@ -224,7 +229,7 @@ def test_against_original_open_llama_3b(device, dtype):
         ),
     ],
 )
-def test_against_hf_llama2(ours_kwargs, device, dtype):
+def test_against_hf_llama_2_and_3(ours_kwargs, device, dtype):
     torch.set_default_dtype(dtype)
 
     ours_config = Config.from_name(
@@ -261,6 +266,7 @@ def test_against_hf_llama2(ours_kwargs, device, dtype):
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("model_name", ("phi-1_5", "phi-2"))
 @pytest.mark.parametrize(
     ("device", "dtype"),
     [
@@ -272,26 +278,14 @@ def test_against_hf_llama2(ours_kwargs, device, dtype):
         ),
     ],
 )
-def test_against_hf_phi_1_5(device, dtype):
-    wd = Path(__file__).parent.parent.resolve()
-    workdir = wd / "tests" / "reference_models"
-    workdir.mkdir(parents=True, exist_ok=True)
-    file_paths = [workdir / "original_phi_1_5.py", workdir / "configuration_phi.py"]
-    urls = [
-        "https://huggingface.co/microsoft/phi-1_5/raw/main/modeling_phi.py",
-        "https://huggingface.co/microsoft/phi-1_5/raw/main/configuration_phi.py",
-    ]
-    for file_path, url in zip(file_paths, urls):
-        if not file_path.is_file():
-            urlretrieve(url=url, filename=file_path)
-
-    from reference_models.configuration_phi import PhiConfig
-    from reference_models.original_phi_1_5 import PhiForCausalLM
+def test_against_hf_phi(model_name, device, dtype):
+    from transformers.models.phi.configuration_phi import PhiConfig
+    from transformers.models.phi.modeling_phi import PhiForCausalLM
 
     torch.set_default_dtype(dtype)
 
     ours_config = Config.from_name(
-        "phi-1_5", padded_vocab_size=10000, n_layer=2, n_head=4, n_embd=256, rotary_percentage=0.5
+        model_name, padded_vocab_size=10000, n_layer=2, n_head=4, n_embd=256, rotary_percentage=0.5
     )
     T = 5
     theirs_config = PhiConfig(
@@ -321,6 +315,7 @@ def test_against_hf_phi_1_5(device, dtype):
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("model_name", ("Phi-3-mini-4k-instruct",))
 @pytest.mark.parametrize(
     ("device", "dtype"),
     [
@@ -332,40 +327,34 @@ def test_against_hf_phi_1_5(device, dtype):
         ),
     ],
 )
-def test_against_hf_phi_2(device, dtype):
-    wd = Path(__file__).parent.parent.resolve()
-    workdir = wd / "tests" / "reference_models"
-    workdir.mkdir(parents=True, exist_ok=True)
-    file_paths = [workdir / "original_phi_2.py", workdir / "configuration_phi.py"]
-    urls = [
-        "https://huggingface.co/microsoft/phi-2/raw/main/modeling_phi.py",
-        "https://huggingface.co/microsoft/phi-2/raw/main/configuration_phi.py",
-    ]
-    for file_path, url in zip(file_paths, urls):
-        if not file_path.is_file():
-            urlretrieve(url=url, filename=file_path)
-
-    from reference_models.configuration_phi import PhiConfig
-    from reference_models.original_phi_2 import PhiForCausalLM
+def test_against_hf_phi_3(model_name, device, dtype):
+    from transformers.models.phi3.configuration_phi3 import Phi3Config
+    from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 
     torch.set_default_dtype(dtype)
 
     ours_config = Config.from_name(
-        "phi-2", padded_vocab_size=10000, n_layer=2, n_head=4, n_embd=256, rotary_percentage=0.5
+        model_name, padded_vocab_size=10000, n_layer=2, n_head=4, n_embd=256,
     )
     T = 5
-    theirs_config = PhiConfig(
-        vocab_size=ours_config.padded_vocab_size,
-        max_position_embeddings=ours_config.block_size,
+    theirs_config = Phi3Config(
+        attention_bias=ours_config.bias,
+        head_dim=ours_config.head_size,
         hidden_size=ours_config.n_embd,
         intermediate_size=ours_config.intermediate_size,
+        max_position_embeddings=T,
         num_attention_heads=ours_config.n_head,
         num_hidden_layers=ours_config.n_layer,
+        num_key_value_heads=ours_config.n_query_groups,
+        pad_token_id=ours_config.padded_vocab_size - 1,
         partial_rotary_factor=ours_config.rotary_percentage,
+        rms_norm_eps=ours_config.norm_eps,
+        rope_theta=ours_config.rope_base,
         torch_dtype=dtype,
+        vocab_size=ours_config.padded_vocab_size,
     )
 
-    theirs_model = PhiForCausalLM(theirs_config).to(device)
+    theirs_model = Phi3ForCausalLM(theirs_config).to(device)
     theirs_state_dict = theirs_model.state_dict()
     state_dict = {}
     copy_weights_phi(ours_config, {}, state_dict, theirs_state_dict)

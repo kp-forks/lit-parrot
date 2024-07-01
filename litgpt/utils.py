@@ -1,14 +1,17 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
 """Utility functions for training and inference."""
+import inspect
 import math
+import os
 import pickle
 import shutil
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Literal, Mapping, Optional, TypeVar, Union
+import warnings
 
 import lightning as L
 import torch
@@ -19,11 +22,32 @@ from lightning.fabric.loggers import CSVLogger, TensorBoardLogger
 from lightning.fabric.strategies import FSDPStrategy
 from lightning.fabric.utilities.load import _lazy_load as lazy_load
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.cli import instantiate_class
 from torch.serialization import normalize_storage_type
 from typing_extensions import Self
 
 if TYPE_CHECKING:
     from litgpt import GPT, Config
+
+
+def init_out_dir(out_dir: Path) -> Path:
+    if not out_dir.is_absolute() and "LIGHTNING_ARTIFACTS_DIR" in os.environ:
+        return Path(os.getenv("LIGHTNING_ARTIFACTS_DIR")) / out_dir
+    return out_dir
+
+
+def find_resume_path(resume: Union[bool, Literal["auto"], Path], out_dir: Path) -> Optional[Path]:
+    if not resume or isinstance(resume, Path):
+        return resume
+
+    resume_path = max(out_dir.rglob("step-*/*.pth"), key=(lambda p: int(p.parent.name.split("-")[1])), default=None)
+    if resume == "auto":
+        return resume_path
+    if resume is True and resume_path is None:
+        raise FileNotFoundError(
+            f"You passed `--resume=True`, but no checkpont file was found in `--out_dir={out_dir}`."
+        )
+    return resume_path
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -52,7 +76,7 @@ def reset_parameters(module: nn.Module) -> None:
             mod.reset_parameters()
 
 
-def check_valid_checkpoint_dir(checkpoint_dir: Path, model_filename: str = "lit_model.pth") -> None:
+def check_valid_checkpoint_dir(checkpoint_dir: Path, model_filename: str = "lit_model.pth", verbose: bool = True, raise_error: bool = False) -> None:
     files = {
         model_filename: (checkpoint_dir / model_filename).is_file(),
         "model_config.yaml": (checkpoint_dir / "model_config.yaml").is_file(),
@@ -71,18 +95,23 @@ def check_valid_checkpoint_dir(checkpoint_dir: Path, model_filename: str = "lit_
     # list locally available checkpoints
     available = list(Path("checkpoints").glob("*/*"))
     if available:
-        options = "\n --checkpoint_dir ".join([""] + [repr(str(p.resolve())) for p in available])
+        options = "\n".join([""] + [repr(str(p.resolve())) for p in available])
         extra = f"\nYou have downloaded locally:{options}\n"
     else:
         extra = ""
 
-    error_message = (
-        f"--checkpoint_dir {str(checkpoint_dir.absolute())!r}{problem}."
-        "\nFind download instructions at https://github.com/Lightning-AI/litgpt/blob/main/tutorials\n"
-        f"{extra}\nSee all download options by running:\n litgpt download"
-    )
-    print(error_message, file=sys.stderr)
-    raise SystemExit(1)
+    if verbose:
+        error_message = (
+            f"checkpoint_dir {str(checkpoint_dir.absolute())!r}{problem}."
+            "\nFind download instructions at https://github.com/Lightning-AI/litgpt/blob/main/tutorials\n"
+            f"{extra}\nSee all download options by running:\n litgpt download"
+        )
+        print(error_message, file=sys.stderr)
+
+    if raise_error:
+        raise FileNotFoundError(f"checkpoint_dir {str(checkpoint_dir.absolute())!r}{problem}.")
+    else:
+        raise SystemExit(1)
 
 
 class SavingProxyForStorage:
@@ -264,7 +293,8 @@ def chunked_cross_entropy(
             for logit_chunk, target_chunk in zip(logit_chunks, target_chunks)
         ]
         non_masked_elems = (targets != ignore_index).sum()
-        return torch.cat(loss_chunks).sum() / max(1, non_masked_elems)
+        # See [non_masked_elems div note]
+        return torch.cat(loss_chunks).sum() / non_masked_elems.maximum(torch.ones_like(non_masked_elems))
 
     # no chunking at all
     logits = logits.reshape(-1, logits.size(-1))
@@ -280,7 +310,11 @@ def chunked_cross_entropy(
         for logit_chunk, target_chunk in zip(logit_chunks, target_chunks)
     ]
     non_masked_elems = (targets != ignore_index).sum()
-    return torch.cat(loss_chunks).sum() / max(1, non_masked_elems)
+    # [non_masked_elems div note]:
+    #   max(1, non_masked_elems) would be more ergonomic to avoid a division by zero. However that
+    #   results in a python int which is then passed back to torch division. By using the
+    #   `x.maximum(torch.ones_like(x))` pattern we avoid a cudaStreamSynchronize.
+    return torch.cat(loss_chunks).sum() / non_masked_elems.maximum(torch.ones_like(non_masked_elems))
 
 
 def map_old_state_dict_weights(state_dict: Dict, mapping: Mapping, prefix: str) -> Dict:
@@ -384,7 +418,7 @@ class CycleIterator:
 def copy_config_files(source_dir: Path, out_dir: Path) -> None:
     """Copies the specified configuration and tokenizer files into the output directory."""
 
-    config_files = ["generation_config.json", "model_config.yaml"]
+    config_files = ["config.json", "generation_config.json", "model_config.yaml"]
     tokenizer_files = ["tokenizer.json", "tokenizer.model", "tokenizer_config.json"]
 
     for file_name in config_files + tokenizer_files:
@@ -399,9 +433,22 @@ def CLI(*args: Any, **kwargs: Any) -> Any:
     set_docstring_parse_options(attribute_docstrings=True)
     set_config_read_mode(urls_enabled=True)
 
-    kwargs.setdefault("as_positional", False)
-
     return CLI(*args, **kwargs)
+
+
+def capture_hparams() -> Dict[str, Any]:
+    """Captures the local variables ('hyperparameters') from where this function gets called."""
+    caller_frame = inspect.currentframe().f_back
+    locals_of_caller = caller_frame.f_locals
+    hparams = {}
+    for name, value in locals_of_caller.items():
+        if value is None or isinstance(value, (int, float, str, bool, Path)):
+            hparams[name] = value
+        elif is_dataclass(value):
+            hparams[name] = asdict(value)
+        else:
+            hparams[name] = str(value)
+    return hparams
 
 
 def save_hyperparameters(function: callable, checkpoint_dir: Path) -> None:
@@ -412,10 +459,11 @@ def save_hyperparameters(function: callable, checkpoint_dir: Path) -> None:
     # This hack strips away the subcommands from the top-level CLI
     # to parse the file as if it was called as a script
     known_commands = [
-        ("finetune", "full"),
-        ("finetune", "lora"),
-        ("finetune", "adapter"),
-        ("finetune", "adapter_v2"),
+        ("finetune_full",),  # For subcommands, use `("finetune", "full")` etc
+        ("finetune_lora",),
+        ("finetune_adapter",),
+        ("finetune_adapter_v2",),
+        ("finetune",),
         ("pretrain",),
     ]
     for known_command in known_commands:
@@ -430,7 +478,7 @@ def save_hyperparameters(function: callable, checkpoint_dir: Path) -> None:
 
 def save_config(config: "Config", checkpoint_dir: Path) -> None:
     config_dict = asdict(config)
-    with open(checkpoint_dir / "model_config.yaml", "w") as fp:
+    with open(checkpoint_dir / "model_config.yaml", "w", encoding="utf-8") as fp:
         yaml.dump(config_dict, fp)
 
 
@@ -457,3 +505,59 @@ def choose_logger(
     if logger_name == "wandb":
         return WandbLogger(project=name, resume=resume, **kwargs)
     raise ValueError(f"`--logger_name={logger_name}` is not a valid option. Choose from 'csv', 'tensorboard', 'wandb'.")
+
+
+def get_argument_names(cls):
+    sig = inspect.signature(cls.__init__)
+    return {name for name, param in sig.parameters.items()
+            if param.kind in [inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY]}
+
+
+def instantiate_bnb_optimizer(optimizer, model_parameters):
+    if (isinstance(optimizer, str) and "AdamW" not in optimizer) or (isinstance(optimizer, dict) and "AdamW" not in optimizer.get("class_path", "")):
+        raise ValueError("The chosen quantization format only supports the AdamW optimizer.")
+
+    import bitsandbytes as bnb
+    if isinstance(optimizer, str):
+        optimizer = bnb.optim.PagedAdamW(model_parameters)
+    else:
+        optim_args = get_argument_names(bnb.optim.PagedAdamW)
+        allowed_kwargs = {key: optimizer["init_args"][key] for key in optim_args & optimizer["init_args"].keys()}
+        optimizer = bnb.optim.PagedAdamW(model_parameters, **allowed_kwargs)
+    return optimizer
+
+
+def instantiate_torch_optimizer(optimizer, model_parameters, **kwargs):
+    if isinstance(optimizer, str):
+        optimizer_cls = getattr(torch.optim, optimizer)
+        optimizer = optimizer_cls(model_parameters, **kwargs)
+    else:
+        optimizer = dict(optimizer)  # copy
+        optimizer["init_args"].update(kwargs)
+        optimizer = instantiate_class(model_parameters, optimizer)
+    return optimizer
+
+
+def extend_checkpoint_dir(checkpoint_dir: Path) -> Path:
+    new_checkpoint_dir = "checkpoints" / checkpoint_dir
+    should_return_new_dir = (not checkpoint_dir.is_dir() and
+                             checkpoint_dir.parts[0] != "checkpoints" and
+                             not checkpoint_dir.is_absolute() and
+                             new_checkpoint_dir.exists())
+    return new_checkpoint_dir if should_return_new_dir else checkpoint_dir
+
+
+def check_file_size_on_cpu_and_warn(checkpoint_path, device, size_limit=4_509_715_660):
+    """
+    Checks the file size and raises a warning if it exceeds the size_limit.
+    The default size limit is 4.2 GB, the size of TinyLlama 1.1B: 4.2 * 1024 * 1024 * 1024 = 4_509_715_660
+    """
+    size = 0.0
+    if os.path.exists(checkpoint_path):
+        size = os.path.getsize(checkpoint_path)
+        if size > size_limit and str(device) == "cpu":
+            warnings.warn(
+                f"The file size of {checkpoint_path} is over {size_limit/1024/1024/1024:.1f} GB. Using a model "
+                "with more than 1B parameters on a CPU can be slow, it is recommended to switch to a GPU."
+            )
+    return size

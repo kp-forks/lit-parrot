@@ -5,13 +5,14 @@ import json
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
+from pprint import pprint
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from lightning.fabric.utilities.load import _NotYetLoadedTensor as NotYetLoadedTensor
 
 from litgpt import Config
-from litgpt.utils import incremental_save, lazy_load, save_config
+from litgpt.utils import extend_checkpoint_dir, incremental_save, lazy_load, save_config
 
 
 def copy_weights_gpt_neox(
@@ -229,13 +230,36 @@ def copy_weights_phi(
         "lm_head.bias": "lm_head.bias",
     }
 
+    if config.name.startswith("Phi-3"):
+        weight_map.update(
+            {
+                "model.layers.{}.self_attn.qkv_proj.weight": "transformer.h.{}.attn.attn.weight",
+                "model.layers.{}.self_attn.o_proj.weight": "transformer.h.{}.attn.proj.weight",
+                'model.layers.{}.post_attention_layernorm.weight': "transformer.h.{}.norm_2.weight",
+                "model.layers.{}.mlp.down_proj.weight": "transformer.h.{}.mlp.proj.weight",
+                "model.norm.weight": "transformer.ln_f.weight",
+            }
+        )
+
     for name, param in hf_weights.items():
         if name.startswith("model.layers."):
             from_name, l = layer_template(name, 2)
             qkv = qkv_weights.setdefault(l, defaultdict(dict))
+            if "qkv_proj" in from_name:
+                weight = load_param(param, f"layer {l} qkv", dtype)
+                weight = qkv_reassemble(weight, config)
+                to_name = weight_map[from_name].format(l)
+                state_dict[to_name] = weight
+                continue
             if any(w in from_name for w in ("q_proj", "k_proj", "v_proj")):
                 weight_name, weight_type = from_name.split(".")[-2:]
                 qkv[weight_type][weight_name] = param
+            elif from_name.endswith("gate_up_proj.weight"):
+                weight = load_param(param, f"layer {l} gate_up_proj", dtype)
+                fc_1, fc_2 = weight.chunk(2, dim=0)
+                state_dict[f"transformer.h.{l}.mlp.fc_1.weight"] = fc_1
+                state_dict[f"transformer.h.{l}.mlp.fc_2.weight"] = fc_2
+                continue
             to_name = weight_map[from_name]
             if to_name is None:
                 continue
@@ -266,6 +290,24 @@ def copy_weights_phi(
             del qkv_weights[i][weight_type]
 
 
+def qkv_reassemble(param: Union[torch.Tensor, NotYetLoadedTensor], config: Config) -> torch.Tensor:
+    """Reassemble from a normal to an interleaved placement in a QKV matrix.
+    [Q, Q, ..., K, K, ..., V, V, ...] --> [Q, K, V, Q, K, V, ...]
+    """
+    q, k, v = param.split(
+        (
+            config.n_head * config.head_size,
+            config.n_query_groups * config.head_size,
+            config.n_query_groups * config.head_size,
+        )
+    )
+    qs = q.split(config.n_head // config.n_query_groups * config.head_size)
+    ks = k.split(config.head_size)
+    vs = v.split(config.head_size)
+    interleaved = [t for group in zip(qs, ks, vs) for t in group]
+    return torch.cat(interleaved)
+
+
 def layer_template(layer_name: str, idx: int) -> Tuple[str, int]:
     split = layer_name.split(".")
     number = int(split[idx])
@@ -287,8 +329,8 @@ def load_param(param: Union[torch.Tensor, NotYetLoadedTensor], name: str, dtype:
 
 @torch.inference_mode()
 def convert_hf_checkpoint(
+    checkpoint_dir: Path,
     *,
-    checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
     model_name: Optional[str] = None,
     dtype: Optional[str] = None,
 ) -> None:
@@ -302,6 +344,9 @@ def convert_hf_checkpoint(
         dtype: The data type to convert the checkpoint files to. If not specified, the weights will remain in the
             dtype they are downloaded in.
     """
+    checkpoint_dir = extend_checkpoint_dir(checkpoint_dir)
+    pprint(locals())
+
     if model_name is None:
         model_name = checkpoint_dir.name
     if dtype is not None:
@@ -312,14 +357,14 @@ def convert_hf_checkpoint(
 
     if "falcon" in model_name:
         copy_fn = partial(copy_weights_falcon, model_name)
+    elif model_name.lower().startswith("phi"):
+        # holder to reconstitute the split q, k, v
+        qkv_weights = {}
+        copy_fn = partial(copy_weights_phi, config, qkv_weights)
     elif config.mlp_class_name in ("LLaMAMLP", "GemmaMLP", "LLaMAMoE"):
         # holder to reconstitute the split q, k, v
         qkv_weights = {}
         copy_fn = partial(copy_weights_hf_llama, config, qkv_weights)
-    elif "phi" in model_name:
-        # holder to reconstitute the split q, k, v
-        qkv_weights = {}
-        copy_fn = partial(copy_weights_phi, config, qkv_weights)
     else:
         copy_fn = copy_weights_gpt_neox
 
@@ -328,10 +373,18 @@ def convert_hf_checkpoint(
 
     # Load the json file containing weight mapping
     pytorch_bin_map_json_path = checkpoint_dir / "pytorch_model.bin.index.json"
+    model_safetensor_map_json_path = checkpoint_dir / "model.safetensors.index.json"
     if pytorch_bin_map_json_path.is_file():  # not all checkpoints have this file
-        with open(pytorch_bin_map_json_path) as json_map:
+        with open(pytorch_bin_map_json_path, encoding="utf-8") as json_map:
             bin_index = json.load(json_map)
         bin_files = {checkpoint_dir / bin for bin in bin_index["weight_map"].values()}
+    elif model_safetensor_map_json_path.is_file():
+        with open(model_safetensor_map_json_path, encoding="utf-8") as json_map:
+            bin_index = json.load(json_map)
+        bin_files = {
+            checkpoint_dir / Path(bin).with_suffix(".bin")
+            for bin in bin_index["weight_map"].values()
+        }
     else:
         bin_files = set(checkpoint_dir.glob("*.bin"))
         # some checkpoints serialize the training arguments
@@ -349,9 +402,3 @@ def convert_hf_checkpoint(
         gc.collect()
         print(f"Saving converted checkpoint to {checkpoint_dir}")
         saver.save(sd)
-
-
-if __name__ == "__main__":
-    from jsonargparse import CLI
-
-    CLI(convert_hf_checkpoint)
